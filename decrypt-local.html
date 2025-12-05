@@ -1,0 +1,147 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Déchiffreur local — messages chiffrés</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width:800px; margin:2rem auto; }
+  label { display:block; margin-top:1rem; }
+  textarea { width:100%; height:140px; font-family: monospace; }
+  input[type="file"] { display:block; margin-top:.5rem; }
+  button { margin-top:1rem; padding:.5rem 1rem; }
+  #out { margin-top:1rem; background:#f6f6f8; padding:.75rem; border-radius:6px; white-space:pre-wrap; }
+  a.download { display:inline-block; margin-top:.5rem; padding:.4rem .6rem; background:#1b85ff; color:#fff; border-radius:4px; text-decoration:none; }
+</style>
+
+<h2>Déchiffreur local</h2>
+<p>Utilise cette page hors connexion pour déchiffrer un paquet JSON chiffré (reçu par mail). Ta clé privée <b>ne quitte jamais ton navigateur</b>.</p>
+
+<label>1) Charger la clé privée (privjwk.json)</label>
+<input id="privfile" type="file" accept=".json">
+
+<label>2) Coller le paquet JSON (depuis le corps du mail) <small>ou</small> charger un fichier .json envoyé</label>
+<textarea id="pkgtext" placeholder='Colle ici le JSON complet reçu (ou laisse vide et choisis "Charger JSON")'></textarea>
+<input id="pkgfile" type="file" accept=".json">
+
+<button id="decrypt">Déchiffrer</button>
+
+<div id="out"></div>
+
+<script>
+/* utilitaires */
+function b64ToAb(b64){
+  const bin = atob(b64);
+  const len = bin.length;
+  const arr = new Uint8Array(len);
+  for(let i=0;i<len;i++) arr[i]=bin.charCodeAt(i);
+  return arr.buffer;
+}
+function abToB64(buf){ return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+
+async function importRecipientPrivateJwk(privJwk){
+  // privJwk : objet JSON (JWK)
+  return crypto.subtle.importKey('jwk', privJwk, { name:'ECDH', namedCurve: privJwk.crv || 'P-256' }, false, ['deriveBits']);
+}
+async function importEphPublicFromJwk(ephJwk){
+  return crypto.subtle.importKey('jwk', ephJwk, { name:'ECDH', namedCurve: ephJwk.crv || 'P-256' }, false, []);
+}
+async function deriveAesKey(recipientPrivKey, ephPubKey){
+  const shared = await crypto.subtle.deriveBits({ name:'ECDH', public: ephPubKey }, recipientPrivKey, 256);
+  return crypto.subtle.importKey('raw', shared, { name:'AES-GCM' }, false, ['decrypt']);
+}
+async function aesDecrypt(aesKey, ivB64, cipherB64){
+  const iv = new Uint8Array(b64ToAb(ivB64));
+  const ct = b64ToAb(cipherB64);
+  const plain = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, aesKey, ct);
+  return plain; // ArrayBuffer
+}
+
+/* lecture de fichiers */
+function readFileAsText(file){
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = ()=>res(r.result);
+    r.onerror = rej;
+    r.readAsText(file, 'utf-8');
+  });
+}
+function readFileAsArrayBuffer(file){
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = ()=>res(r.result);
+    r.onerror = rej;
+    r.readAsArrayBuffer(file);
+  });
+}
+
+/* UI handling */
+document.getElementById('pkgfile').addEventListener('change', async (ev)=>{
+  const f = ev.target.files[0];
+  if(!f) return;
+  try{
+    const txt = await readFileAsText(f);
+    document.getElementById('pkgtext').value = txt;
+  }catch(e){
+    alert('Impossible de lire le fichier JSON: ' + e.message);
+  }
+});
+
+document.getElementById('decrypt').addEventListener('click', async ()=>{
+  const outEl = document.getElementById('out');
+  outEl.textContent = '';
+  try{
+    // 1) charger privJWK
+    const pf = document.getElementById('privfile').files[0];
+    if(!pf) { alert('Charge d’abord ta clé privée (privjwk.json).'); return; }
+    const privText = await readFileAsText(pf);
+    let privJwk;
+    try { privJwk = JSON.parse(privText); } catch(e){ throw new Error('privjwk.json invalide'); }
+
+    // 2) charger package JSON
+    const pkgText = document.getElementById('pkgtext').value.trim();
+    if(!pkgText){ alert('Colle ou charge le paquet JSON reçu (ex: depuis le mail).'); return; }
+    let pkg;
+    try { pkg = JSON.parse(pkgText); } catch(e){ throw new Error('Le paquet JSON collé est invalide.'); }
+
+    outEl.textContent = 'Import de la clé privée...';
+    const recipientPrivKey = await importRecipientPrivateJwk(privJwk);
+
+    // importer la clé publique éphémère
+    if(!pkg.ephemeral_pub_jwk || !pkg.payload || !pkg.payload.encryptedMessage) throw new Error('Structure du paquet non reconnue.');
+
+    outEl.textContent = 'Import de la clé publique éphémère & dérivation...';
+    const ephPub = await importEphPublicFromJwk(pkg.ephemeral_pub_jwk);
+    const aesKey = await deriveAesKey(recipientPrivKey, ephPub);
+
+    outEl.textContent = 'Déchiffrement du message...';
+    const encMsg = pkg.payload.encryptedMessage;
+    const plainBuf = await aesDecrypt(aesKey, encMsg.iv, encMsg.ciphertext);
+    const messageText = new TextDecoder().decode(plainBuf);
+
+    let resultText = '--- MESSAGE ---\n' + messageText + '\n\n';
+
+    // fichier éventuel
+    if(pkg.payload.file && pkg.payload.file.encrypted){
+      outEl.textContent = 'Déchiffrement du fichier attaché...';
+      const fenc = pkg.payload.file.encrypted;
+      const fbuf = await aesDecrypt(aesKey, fenc.iv, fenc.ciphertext);
+      const blob = new Blob([fbuf]);
+      const url = URL.createObjectURL(blob);
+      const filename = pkg.payload.file.name || 'attachment.bin';
+      resultText += 'Fichier joint: ' + filename + '\n';
+      outEl.innerHTML = `<pre>${escapeHtml(resultText)}</pre><a class="download" href="${url}" download="${encodeURIComponent(filename)}">Télécharger le fichier</a>`;
+    } else {
+      outEl.textContent = resultText;
+    }
+
+    // show meta if present
+    if(pkg.meta){
+      outEl.innerHTML += '\n\n' + '<pre>— Méta —\n' + escapeHtml(JSON.stringify(pkg.meta, null, 2)) + '</pre>';
+    }
+  }catch(err){
+    document.getElementById('out').textContent = 'Erreur : ' + (err.message || err);
+    console.error(err);
+  }
+});
+
+/* helper pour afficher en safe */
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+</script>

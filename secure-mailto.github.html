@@ -1,0 +1,121 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Envoyer un message chiffré</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; line-height: 1.5; }
+  textarea, input[type="file"] { width: 100%; margin-top: .5rem; }
+  textarea { height: 120px; font-family: monospace; }
+  button { margin-top: 1rem; padding: .5rem 1rem; font-size: 1rem; cursor: pointer; background: #007cba; color: white; border: none; border-radius: 4px; }
+  button:hover { background: #005a87; }
+  #status { margin-top: 1rem; background: #f6f6f6; padding: .75rem; border-radius: 6px; white-space: pre-wrap; }
+  #warning { color: #b00; font-weight: bold; margin-top: 1rem; }
+</style>
+
+<h2>Envoyer un message chiffré</h2>
+<p>
+Les messages sont chiffrés dans ton navigateur avant d'être envoyés.
+Aucun compte n'est nécessaire.
+</p>
+
+<label for="message">Ton message</label>
+<textarea id="message" placeholder="Écris ici ton message..."></textarea>
+
+<label for="file">Pièce jointe (optionnelle)</label>
+<input id="file" type="file">
+
+<button id="send">Chiffrer & envoyer par email</button>
+
+<div id="status"></div>
+<div id="warning"></div>
+
+<script>
+/* === CONFIGURATION === */
+const RECIPIENT_PUB_URL = 'https://hacemosourways.github.io/message/pubjwk.json';
+const RECIPIENT_EMAIL   = 'h4c3m050urw4y5@disr.it';
+const MAX_MAILTO_LENGTH = 1800;
+
+/* === UTILITAIRES === */
+function abToB64(buf){ return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+function b64ToAb(b64){ const bin = atob(b64); const arr = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i); return arr.buffer; }
+
+async function importEcdhPublic(jwk){
+  return crypto.subtle.importKey('jwk', jwk, { name:'ECDH', namedCurve:jwk.crv||'P-256' }, false, []);
+}
+async function generateEphemeralKeyPair(){
+  return crypto.subtle.generateKey({ name:'ECDH', namedCurve:'P-256' }, true, ['deriveBits']);
+}
+async function deriveBits(priv, pub){
+  return crypto.subtle.deriveBits({ name:'ECDH', public: pub }, priv, 256);
+}
+async function importAesKeyFromRaw(raw){
+  return crypto.subtle.importKey('raw', raw, { name:'AES-GCM' }, false, ['encrypt','decrypt']);
+}
+async function aesGcmEncrypt(aesKey, buf){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, aesKey, buf);
+  return { iv: abToB64(iv.buffer), ciphertext: abToB64(ct) };
+}
+function readFileAsArrayBuffer(file){
+  return new Promise((res, rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsArrayBuffer(file); });
+}
+async function exportPublicJwk(key){ return crypto.subtle.exportKey('jwk', key); }
+function setStatus(txt){ document.getElementById('status').textContent = txt; }
+function setWarning(txt){ document.getElementById('warning').textContent = txt || ''; }
+
+/* === ACTION PRINCIPALE === */
+document.getElementById('send').addEventListener('click', async ()=>{
+  setStatus('Chargement de la clé publique...');
+  setWarning('');
+  
+  try {
+    const resp = await fetch(RECIPIENT_PUB_URL);
+    if(!resp.ok) throw new Error('Impossible de charger la clé publique.');
+    const recipJwk = await resp.json();
+    const recipPub = await importEcdhPublic(recipJwk);
+
+    setStatus('Génération des clés et chiffrement...');
+    const eph = await generateEphemeralKeyPair();
+    const sharedBits = await deriveBits(eph.privateKey, recipPub);
+    const aesKey = await importAesKeyFromRaw(sharedBits);
+
+    const messageText = document.getElementById('message').value || '';
+    const encMsg = await aesGcmEncrypt(aesKey, new TextEncoder().encode(messageText));
+
+    const payload = { created_at: new Date().toISOString(), encryptedMessage: encMsg };
+
+    const fileInput = document.getElementById('file');
+    if(fileInput.files && fileInput.files[0]){
+      const f = fileInput.files[0];
+      const buf = await readFileAsArrayBuffer(f);
+      const encFile = await aesGcmEncrypt(aesKey, buf);
+      payload.file = { name: f.name, encrypted: encFile };
+    }
+
+    const ephPubJwk = await exportPublicJwk(eph.publicKey);
+    const packageToSend = { ephemeral_pub_jwk: ephPubJwk, payload, meta:{ origin: location.href } };
+    const jsonStr = JSON.stringify(packageToSend, null, 2);
+
+    setStatus("✅ Chiffrement réussi !");
+
+    const encodedBody = encodeURIComponent(jsonStr);
+    const mailtoURL = `mailto:${encodeURIComponent(RECIPIENT_EMAIL)}?subject=${encodeURIComponent('Message chiffré')}&body=${encodedBody}`;
+
+    if(mailtoURL.length > MAX_MAILTO_LENGTH){
+      setWarning('⚠️ Le message est trop long pour être envoyé automatiquement.');
+      setStatus('Copiez le texte ci-dessous et collez-le dans un email à : ' + RECIPIENT_EMAIL + '\n\n' + jsonStr);
+    } else {
+      setStatus('Ouverture de votre client email...');
+      window.open(mailtoURL, '_blank');
+      
+      // Fallback simple après 3 secondes
+      setTimeout(() => {
+        setWarning('💡 Si votre client email ne s\'est pas ouvert, copiez le texte ci-dessous :');
+        setStatus(jsonStr);
+      }, 3000);
+    }
+  } catch(err){
+    console.error(err);
+    setStatus('Erreur : ' + (err.message || err));
+  }
+});
+</script>
